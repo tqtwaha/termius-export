@@ -36,6 +36,31 @@ if TYPE_CHECKING:
     from .source import RawTables
 
 
+def _is_ref_id(value) -> bool:
+    # bool is an int subclass but never an id. Anything else that is not int/str is V8's
+    # `undefined`, which ccl_chromium_reader hands back as a sentinel object.
+    return isinstance(value, (int, str)) and not isinstance(value, bool)
+
+
+def adopt_record_key(row: dict, record_key) -> dict:
+    """Make a raw IndexedDB row resolvable by reference.
+
+    A row created while sync is off has never been given a server ``id``: it is ``undefined``
+    rather than absent, and every such row shares that one value. Some of these rows also lack
+    ``local_id`` in the value and carry it only as the IndexedDB record key (a float, ``145.0``).
+    Drop the meaningless ``id`` and take ``local_id`` from the key, so these rows deduplicate
+    and dereference by ``local_id`` like any other.
+    """
+    if not _is_ref_id(row.get("id")):
+        row.pop("id", None)
+    if not _is_ref_id(row.get("local_id")):
+        try:
+            row["local_id"] = int(float(str(record_key)))
+        except (TypeError, ValueError):
+            row.pop("local_id", None)
+    return row
+
+
 def _index(rows: list[dict]) -> dict[str, dict]:
     idx: dict[str, dict] = {}
     for r in rows:
@@ -52,9 +77,9 @@ def _deref(ref, idx: dict[str, dict]) -> dict | None:
     if not isinstance(ref, dict):
         return idx.get(f"id:{ref}") or idx.get(f"lid:{ref}")
     out = None
-    if ref.get("id") is not None:
+    if _is_ref_id(ref.get("id")):
         out = idx.get(f"id:{ref['id']}")
-    if out is None and ref.get("local_id") is not None:
+    if out is None and _is_ref_id(ref.get("local_id")):
         out = idx.get(f"lid:{ref['local_id']}")
     return out
 
@@ -136,10 +161,41 @@ def build_model(tables: RawTables, dec: Decryptor, *, source_info: dict | None =
     hosts: list[Host] = []
     hosts_by_entity: dict[str, Host] = {}
 
+    identity_by_cfg: dict[str, object] = {}
+    for link in decrypted.get("ssh_config_identities", []):
+        linked_cfg = _deref(link.get("ssh_config"), ssh_configs)
+        if linked_cfg and link.get("identity"):
+            identity_by_cfg[_entity_key(linked_cfg)] = link["identity"]
+
+    def cfg_identity(c: dict) -> dict | None:
+        return _deref(c.get("identity"), identities) or _deref(identity_by_cfg.get(_entity_key(c)), identities)
+
+    def group_chain(row: dict) -> list[dict]:
+        """The host's group, then each parent up to the root. Termius nests groups and a host
+        inherits whatever its own config leaves unset from the nearest group that sets it."""
+        chain: list[dict] = []
+        seen: set[str] = set()
+        g = _deref(row.get("group"), groups)
+        while g is not None and _entity_key(g) not in seen:
+            seen.add(_entity_key(g))
+            chain.append(g)
+            g = _deref(g.get("parent_group"), groups)
+        return chain
+
     for row in decrypted.get("hosts", []):
         cfg = _deref(row.get("ssh_config"), ssh_configs) or {}
-        identity = _deref(cfg.get("identity") or row.get("identity"), identities)
-        key_row = _deref((identity or {}).get("ssh_key"), key_index)
+        chain = group_chain(row)
+        cfgs = [cfg] + [_deref(g.get("ssh_config"), ssh_configs) or {} for g in chain]
+        idents = [(cfg_identity(cfg) if cfg else None) or _deref(row.get("identity"), identities)]
+        idents += [cfg_identity(c) for c in cfgs[1:] if c]
+        idents = [i for i in idents if i]
+
+        # Termius shows an empty host field as inheriting the group's value, so an empty
+        # string here means "unset", unlike an empty label (see trap 2 in CLAUDE.md).
+        def first(field: str, _idents=idents) -> str:
+            return next((_text(i.get(field)) for i in _idents if _text(i.get(field))), "")
+
+        key_row = next((k for k in (_deref(i.get("ssh_key"), key_index) for i in idents) if k), None)
         key = keys_by_entity.get(_entity_key(key_row)) if key_row else None
         if key:
             key.linked = True
@@ -150,7 +206,7 @@ def build_model(tables: RawTables, dec: Decryptor, *, source_info: dict | None =
         address = expand_packed_ipv4(_text(row.get("address")))
 
         proxy = None
-        proxy_row = _deref(cfg.get("proxycommand"), proxies)
+        proxy_row = next((r for r in (_deref(c.get("proxycommand"), proxies) for c in cfgs) if r), None)
         if proxy_row and proxy_row.get("hostname") and proxy_row.get("port"):
             proxy_identity = _deref(proxy_row.get("identity"), identities) or {}
             proxy = Proxy(
@@ -162,7 +218,7 @@ def build_model(tables: RawTables, dec: Decryptor, *, source_info: dict | None =
             )
 
         try:
-            port = int(cfg.get("port") or 22)
+            port = int(next((c.get("port") for c in cfgs if c.get("port")), 22))
         except (TypeError, ValueError):
             port = 22
 
@@ -174,9 +230,11 @@ def build_model(tables: RawTables, dec: Decryptor, *, source_info: dict | None =
             label_was_empty=label == "",
             address=address,
             port=port if port > 0 else 22,
-            username=_text((identity or {}).get("username")),
-            password=_text((identity or {}).get("password")),
-            group=_text((_deref(row.get("group"), groups) or {}).get("label")),
+            username=first("username"),
+            password=first("password"),
+            # Full "/"-separated path ("Clients/Acme"). The leaf alone is ambiguous: two
+            # "Servers" groups under different parents would merge into one.
+            group="/".join(_text(g.get("label")) for g in reversed(chain) if _text(g.get("label"))),
             key=key,
             proxy=proxy,
             agent_forward=bool(cfg.get("agent_forwarding")),
